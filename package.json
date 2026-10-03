@@ -1,0 +1,11 @@
+{
+  "name": "caixa",
+  "private": true,
+  "description": "Controle financeiro: site estático (GitHub Pages) + planilha Google como banco de dados",
+  "scripts": {
+    "test": "node tests/run.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.47.0"
+  }
+}

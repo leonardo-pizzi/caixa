@@ -28,13 +28,30 @@ assinaturas. O site lança sozinho os próximos 12 meses e completa os novos a c
   não mexe mais nele.
 - **Feriados** (Ajustes): nacionais, Carnaval/Corpus Christi opcionais e os da sua cidade.
 
+## Banco de dados universal
+
+A planilha é o banco de dados e foi feita para durar mais que o site:
+
+- **Nada é apagado nem renomeado.** Abas e colunas novas são criadas sozinhas; campos
+  que uma tela não conhece são mantidos quando ela salva algo.
+- **Aba `_Dicionario`**: descreve cada aba e coluna (tipo, chave e significado), para
+  qualquer programa futuro entender e reaproveitar os dados.
+- **Formatos simples**: datas `AAAA-MM-DD`, valores numéricos, sim/não.
+- **Migrações**: se o formato de algo mudar, o site faz uma cópia de segurança e
+  converte os dados uma única vez, sem apagar o original.
+- O script é genérico: melhorias no site não exigem mexer nele.
+
 ## Atualizar o script
 
-O script é genérico: o site diz em cada pedido quais abas e colunas existem e o
-script cria o que faltar. Por isso, melhorias no site **não exigem** mexer nele.
-Só se o `script/Code.gs` mudar (raro): copie o novo conteúdo para o editor do Apps
+Raro. Só se o `script/Code.gs` mudar: copie o novo conteúdo para o editor do Apps
 Script, salve e vá em **Implantar → Gerenciar implantações → ✏️ → Versão: Nova
 versão → Implantar**. Os dados, o endereço `/exec` e a chave continuam os mesmos.
+
+## Desenvolvimento
+
+`npm install` e `npm test` rodam os testes (simulam o Google, sem precisar de conta).
+A cada envio ao `main`, o GitHub roda os testes e só publica o site se passarem.
+Regras do projeto: [CLAUDE.md](CLAUDE.md).
 
 ## Instalação (uma vez só)
 
@@ -62,6 +79,5 @@ Versão: Nova versão**. Assim o endereço `/exec` continua o mesmo.
 
 ## Publicar o site
 
-No GitHub: **Settings → Pages → Build and deployment → Deploy from a branch**,
-escolha o branch e a pasta `/ (root)`. O Caixa fica em
+No GitHub: **Settings → Pages → Build and deployment → Source: GitHub Actions**. O Caixa fica em
 `https://leonardo-pizzi.github.io/caixa/`.

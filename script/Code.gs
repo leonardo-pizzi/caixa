@@ -15,7 +15,7 @@
 
 var BACKUP_FOLDER = 'Caixa - backups';
 var BACKUP_KEEP = 30; // quantas cópias diárias manter
-var API_VERSION = 3;
+var API_VERSION = 4;
 
 // Esquema mínimo; o site manda o completo em cada pedido. Colunas em `num` são
 // números, em `bool` verdadeiro/falso; o resto é texto (datas em AAAA-MM-DD).
@@ -30,8 +30,8 @@ var TABLES = {
     num: ['fechamento', 'vencimento', 'limite'],
     bool: ['ativo']
   },
-  Categorias: { headers: ['nome', 'tipo', 'cor'] },
-  Config: { headers: ['chave', 'valor'] },
+  Categorias: { headers: ['nome', 'tipo', 'cor'], key: ['nome', 'tipo'] },
+  Config: { headers: ['chave', 'valor'], key: 'chave' },
   Recorrencias: {
     headers: ['id', 'descricao', 'tipo', 'categoria', 'forma', 'cartaoId', 'valor', 'valorModo', 'refMes',
               'diaModo', 'dia', 'sabado', 'inicio', 'fim', 'pulados', 'ajustados', 'valores', 'obs', 'criadoEm'],
@@ -82,19 +82,84 @@ function doGet() {
 
 var NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,40}$/;
 
-/** Junta o esquema enviado pelo site ao padrão (só acrescenta abas e colunas). */
+/**
+ * Junta um esquema ao atual. Só ACRESCENTA abas, colunas e tipos: nada é
+ * removido nem renomeado, para nenhum dado se perder. Devolve true se mudou.
+ */
 function applySchema_(schema) {
-  if (!schema || typeof schema !== 'object') return;
+  var changed = false;
+  if (!schema || typeof schema !== 'object') return false;
   Object.keys(schema).forEach(function (name) {
     var t = schema[name];
     if (!NAME_RE.test(name) || !t || !Array.isArray(t.headers)) return;
-    var cur = TABLES[name] || (TABLES[name] = { headers: [], num: [], bool: [] });
+    if (!TABLES[name]) { TABLES[name] = { headers: [], num: [], bool: [] }; changed = true; }
+    var cur = TABLES[name];
     ['headers', 'num', 'bool'].forEach(function (k) {
       cur[k] = cur[k] || [];
-      (t[k] || []).forEach(function (h) { if (NAME_RE.test(h) && cur[k].indexOf(h) < 0) cur[k].push(h); });
+      (t[k] || []).forEach(function (h) { if (NAME_RE.test(h) && cur[k].indexOf(h) < 0) { cur[k].push(h); changed = true; } });
     });
-    if (t.key && NAME_RE.test(t.key)) cur.key = t.key;
+    var key = Array.isArray(t.key) ? t.key.filter(function (h) { return NAME_RE.test(h); }) : (NAME_RE.test(t.key || '') ? t.key : null);
+    if (key && (Array.isArray(key) ? key.length : true) && JSON.stringify(cur.key) !== JSON.stringify(key)) { cur.key = key; changed = true; }
   });
+  return changed;
+}
+
+/** O esquema acumulado fica salvo no script, para valer mesmo em pedidos sem esquema. */
+function loadSchema_() {
+  try { applySchema_(JSON.parse(PropertiesService.getScriptProperties().getProperty('SCHEMA') || '{}')); } catch (e) { /* ignora */ }
+}
+function saveSchema_() {
+  PropertiesService.getScriptProperties().setProperty('SCHEMA', JSON.stringify(TABLES));
+}
+
+/**
+ * Aba _Dicionario: descreve cada aba e coluna (tipo, chave e significado), para que
+ * qualquer programa futuro entenda e reaproveite os dados sem depender deste site.
+ * Reescrita só quando o esquema ou as descrições mudam.
+ */
+function updateDictionary_(schema) {
+  var docs = {};
+  Object.keys(schema || {}).forEach(function (n) {
+    var t = schema[n];
+    if (NAME_RE.test(n) && t && (t.desc || t.fields)) docs[n] = { desc: String(t.desc || ''), fields: t.fields || {} };
+  });
+  var props = PropertiesService.getScriptProperties();
+  var sig = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify([docs, TABLES])));
+  if (props.getProperty('DICT_SIG') === sig) return;
+  var ss = getSS_(), sh = ss.getSheetByName('_Dicionario') || ss.insertSheet('_Dicionario');
+  var rows = [['aba', 'campo', 'tipo', 'chave', 'descricao']];
+  Object.keys(TABLES).forEach(function (n) {
+    var t = TABLES[n], d = docs[n] || { desc: '', fields: {} }, key = t.key || 'id';
+    rows.push([n, '', 'aba', '', d.desc]);
+    t.headers.forEach(function (h) {
+      var tipo = t.num && t.num.indexOf(h) > -1 ? 'número' : t.bool && t.bool.indexOf(h) > -1 ? 'sim/não' : 'texto';
+      var isKey = Array.isArray(key) ? key.indexOf(h) > -1 : key === h;
+      rows.push([n, h, tipo, isKey ? 'sim' : '', String((d.fields || {})[h] || '')]);
+    });
+  });
+  sh.clearContents();
+  sh.getRange(1, 1, rows.length, 5).setNumberFormat('@').setValues(rows);
+  sh.getRange(1, 1, 1, 5).setFontWeight('bold').setBackground('#E2E9E5');
+  sh.setFrozenRows(1);
+  props.setProperty('DICT_SIG', sig);
+}
+
+/** Campos que chegam sem coluna ganham uma (tipo pelo valor), em vez de serem descartados. */
+function ensureFields_(name, rows) {
+  var t = TABLES[name], add = { headers: [], num: [], bool: [] };
+  rows.forEach(function (r) {
+    Object.keys(r).forEach(function (h) {
+      if (!NAME_RE.test(h) || t.headers.indexOf(h) > -1 || add.headers.indexOf(h) > -1) return;
+      add.headers.push(h);
+      if (typeof r[h] === 'number') add.num.push(h);
+      else if (typeof r[h] === 'boolean') add.bool.push(h);
+    });
+  });
+  if (!add.headers.length) return;
+  var one = {}; one[name] = add;
+  applySchema_(one);
+  delete sheets_[name];
+  saveSchema_();
 }
 
 function table_(name) {
@@ -105,7 +170,12 @@ function rowsArg_(rows) {
   if (!Array.isArray(rows)) reject_('Dados inválidos.');
   return rows.filter(function (r) { return r && typeof r === 'object'; });
 }
-function key_(name) { return TABLES[name].key || 'id'; }
+/** Identificação de uma linha: a coluna-chave (padrão "id") ou várias juntas, como nome + tipo. */
+function rowKey_(name, r) {
+  var k = TABLES[name].key || 'id';
+  if (!Array.isArray(k)) return r[k] === undefined || r[k] === null ? '' : String(r[k]);
+  return k.map(function (h) { return r[h] === undefined || r[h] === null ? '' : String(r[h]); }).join('|');
+}
 
 var ACTIONS = {
   load: function () { return api_load(); },
@@ -116,6 +186,7 @@ var ACTIONS = {
   upsert: function (t, row) { return api_upsert(table_(t), rowsArg_([row])[0] || reject_('Dados inválidos.')); },
   replace: function (t, rows) { return api_replace(table_(t), rowsArg_(rows)); },
   saveCfg: function (cfg) { return api_saveCfg(cfg); },
+  backup: function (motivo) { return api_backup(String(motivo || '')); },
   // Nomes antigos, mantidos para alterações que ainda estejam na fila de algum aparelho.
   addTx: function (rows) { return api_add('Lancamentos', rowsArg_(rows)); },
   updateTx: function (patches) { return api_update('Lancamentos', rowsArg_(patches)); },
@@ -147,7 +218,9 @@ function doPost(e) {
     } else {
       var fn = ACTIONS[req.action];
       if (!fn) reject_('Ação desconhecida: ' + req.action);
-      applySchema_(req.schema);
+      loadSchema_();
+      if (applySchema_(req.schema)) saveSchema_();
+      if (req.action === 'load' && req.schema) { try { updateDictionary_(req.schema); } catch (de) { /* o dicionário nunca impede o uso */ } }
       out = { ok: true, data: fn.apply(null, Array.isArray(req.args) ? req.args : []) };
     }
   } catch (err) {
@@ -168,11 +241,22 @@ function reject_(msg) {
 
 /** Roda todo dia (gatilho criado pelo setup): copia a planilha para a pasta de backups. */
 function backupDiario() {
+  copia_('Caixa - backup ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd'));
+}
+
+/** Cópia pedida pelo site, por exemplo antes de uma migração de dados. */
+function api_backup(motivo) {
+  var nome = 'Caixa - backup ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm') +
+    (motivo ? ' (' + motivo.slice(0, 60) + ')' : '');
+  copia_(nome);
+  return nome;
+}
+
+function copia_(nome) {
   var ss = getSS_();
   var it = DriveApp.getFoldersByName(BACKUP_FOLDER);
   var folder = it.hasNext() ? it.next() : DriveApp.createFolder(BACKUP_FOLDER);
-  var stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  DriveApp.getFileById(ss.getId()).makeCopy('Caixa - backup ' + stamp, folder);
+  DriveApp.getFileById(ss.getId()).makeCopy(nome, folder);
   var files = [], fi = folder.getFiles();
   while (fi.hasNext()) files.push(fi.next());
   files.sort(function (a, b) { return b.getDateCreated() - a.getDateCreated(); });
@@ -314,7 +398,7 @@ function api_load() {
   var tables = {};
   Object.keys(TABLES).forEach(function (n) { if (n !== 'Config') tables[n] = readTable_(n); });
   return {
-    v: API_VERSION, cfg: cfg, tables: tables,
+    v: API_VERSION, cfg: cfg, tables: tables, schema: TABLES,
     // nomes usados pelo site desde a primeira versão
     cards: tables.Cartoes, cats: tables.Categorias, tx: tables.Lancamentos, rules: tables.Recorrencias,
     ssUrl: getSS_().getUrl()
@@ -324,11 +408,13 @@ function api_load() {
 /** Acrescenta linhas; as que já existem (mesmo id) são ignoradas, então reenviar não duplica. */
 function api_add(name, rows) {
   return withLock_(function () {
-    var k = key_(name), seen = {};
-    readTable_(name).forEach(function (r) { seen[r[k]] = true; });
+    ensureFields_(name, rows);
+    var seen = {};
+    readTable_(name).forEach(function (r) { seen[rowKey_(name, r)] = true; });
     appendRows_(name, rows.filter(function (r) {
-      if (!r[k] || seen[r[k]]) return false;
-      seen[r[k]] = true; return true;
+      var id = rowKey_(name, r);
+      if (!id || seen[id]) return false;
+      seen[id] = true; return true;
     }));
     return true;
   });
@@ -337,12 +423,13 @@ function api_add(name, rows) {
 /** patches: [{id, campo: valor, ...}] — só altera os campos enviados. */
 function api_update(name, patches) {
   return withLock_(function () {
-    var k = key_(name), all = readTable_(name), byId = {};
-    patches.forEach(function (p) { byId[p[k]] = p; });
+    ensureFields_(name, patches);
+    var all = readTable_(name), byId = {};
+    patches.forEach(function (p) { byId[rowKey_(name, p)] = p; });
     all.forEach(function (r) {
-      var p = byId[r[k]];
+      var p = byId[rowKey_(name, r)];
       if (!p) return;
-      Object.keys(p).forEach(function (f) { if (f !== k && f in r) r[f] = p[f]; });
+      Object.keys(p).forEach(function (f) { r[f] = p[f]; });
     });
     writeTable_(name, all);
     return true;
@@ -351,26 +438,42 @@ function api_update(name, patches) {
 
 function api_remove(name, ids) {
   return withLock_(function () {
-    var k = key_(name), drop = {};
-    ids.forEach(function (i) { drop[i] = true; });
-    writeTable_(name, readTable_(name).filter(function (r) { return !drop[r[k]]; }));
+    var drop = {};
+    ids.forEach(function (i) { drop[String(i)] = true; });
+    writeTable_(name, readTable_(name).filter(function (r) { return !drop[rowKey_(name, r)]; }));
     return true;
   });
 }
 
 function api_upsert(name, row) {
-  if (!row || !row[key_(name)]) reject_('Dados inválidos.');
+  if (!row || !rowKey_(name, row).replace(/\|/g, '')) reject_('Dados inválidos.');
   return withLock_(function () {
-    var k = key_(name), all = readTable_(name), found = false;
-    all = all.map(function (r) { if (r[k] === row[k]) { found = true; return row; } return r; });
+    ensureFields_(name, [row]);
+    var id = rowKey_(name, row), all = readTable_(name), found = false;
+    // Mescla com o que já existe: campos que o site não mandou continuam lá.
+    all = all.map(function (r) { if (rowKey_(name, r) === id) { found = true; return mergeRow_(r, row); } return r; });
     if (!found) all.push(row);
     writeTable_(name, all);
     return true;
   });
 }
 
+/** Troca a aba inteira pela lista enviada; linhas que continuam mantêm os campos não enviados. */
 function api_replace(name, rows) {
-  return withLock_(function () { writeTable_(name, rows); return true; });
+  return withLock_(function () {
+    ensureFields_(name, rows);
+    var old = {};
+    readTable_(name).forEach(function (r) { var id = rowKey_(name, r); if (id.replace(/\|/g, '')) old[id] = r; });
+    writeTable_(name, rows.map(function (r) { var o = old[rowKey_(name, r)]; return o ? mergeRow_(o, r) : r; }));
+    return true;
+  });
+}
+
+function mergeRow_(oldRow, newRow) {
+  var out = {};
+  Object.keys(oldRow).forEach(function (f) { out[f] = oldRow[f]; });
+  Object.keys(newRow).forEach(function (f) { out[f] = newRow[f]; });
+  return out;
 }
 
 function api_saveCfg(cfg) {
