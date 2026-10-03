@@ -29,8 +29,17 @@ var TABLES = {
   },
   Config: {
     headers: ['chave', 'valor']
+  },
+  // Regras de lançamentos que se repetem todo mês (salário, benefícios, contas fixas).
+  Recorrencias: {
+    headers: ['id', 'descricao', 'tipo', 'categoria', 'forma', 'cartaoId', 'valor', 'valorModo', 'refMes',
+              'diaModo', 'dia', 'sabado', 'inicio', 'fim', 'pulados', 'ajustados', 'valores', 'obs', 'criadoEm'],
+    num: ['valor', 'dia'],
+    bool: ['sabado']
   }
 };
+
+var API_VERSION = 2;
 
 var DEFAULT_CATS = [
   ['Moradia', 'Despesa', '#17604F'], ['Mercado', 'Despesa', '#5E7A2E'], ['Alimentação', 'Despesa', '#C26A2B'],
@@ -81,7 +90,9 @@ var ACTIONS = {
   saveCard: function (card) { return api_saveCard(card); },
   deleteCard: function (id) { return api_deleteCard(id); },
   saveCats: function (cats) { return api_saveCats(cats); },
-  saveCfg: function (cfg) { return api_saveCfg(cfg); }
+  saveCfg: function (cfg) { return api_saveCfg(cfg); },
+  saveRule: function (rule) { return api_saveRule(rule); },
+  deleteRule: function (id) { return api_deleteRule(id); }
 };
 
 /**
@@ -251,14 +262,16 @@ function api_load() {
   var cfgRows = readTable_('Config');
   var cfg = { saldoInicial: 0, dataInicio: '' };
   cfgRows.forEach(function (r) {
-    if (r.chave === 'saldoInicial') cfg.saldoInicial = Number(String(r.valor).replace(',', '.')) || 0;
-    if (r.chave === 'dataInicio') cfg.dataInicio = r.valor;
+    if (!r.chave) return;
+    cfg[r.chave] = r.chave === 'saldoInicial' ? (Number(String(r.valor).replace(',', '.')) || 0) : r.valor;
   });
   return {
+    v: API_VERSION,
     cfg: cfg,
     cards: readTable_('Cartoes'),
     cats: readTable_('Categorias'),
     tx: readTable_('Lancamentos'),
+    rules: readTable_('Recorrencias'),
     ssUrl: getSS_().getUrl()
   };
 }
@@ -342,10 +355,32 @@ function api_saveCats(cats) {
 
 function api_saveCfg(cfg) {
   return withLock_(function () {
-    writeTable_('Config', [
-      { chave: 'saldoInicial', valor: String(Number(cfg.saldoInicial) || 0) },
-      { chave: 'dataInicio', valor: String(cfg.dataInicio || '') }
-    ]);
+    if (!cfg || typeof cfg !== 'object') reject_('Ajustes inválidos.');
+    // Guarda todas as chaves enviadas (saldo, data de início, feriados…), sempre como texto.
+    var rows = Object.keys(cfg).map(function (k) {
+      var v = cfg[k];
+      if (k === 'saldoInicial') v = Number(v) || 0;
+      return { chave: k, valor: (v !== null && typeof v === 'object') ? JSON.stringify(v) : String(v === undefined || v === null ? '' : v) };
+    });
+    writeTable_('Config', rows);
+    return true;
+  });
+}
+
+function api_saveRule(rule) {
+  if (!rule || !rule.id) reject_('Recorrência inválida.');
+  return withLock_(function () {
+    var all = readTable_('Recorrencias'), found = false;
+    all = all.map(function (r) { if (r.id === rule.id) { found = true; return rule; } return r; });
+    if (!found) all.push(rule);
+    writeTable_('Recorrencias', all);
+    return true;
+  });
+}
+
+function api_deleteRule(id) {
+  return withLock_(function () {
+    writeTable_('Recorrencias', readTable_('Recorrencias').filter(function (r) { return r.id !== id; }));
     return true;
   });
 }

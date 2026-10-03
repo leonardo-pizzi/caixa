@@ -100,6 +100,150 @@ function schedule(f) {
     vencimento: addMonths(f.vencimento, i, vday)
   }));
 }
+/* =====================================================================
+   Dias úteis, feriados e recorrências
+   ===================================================================== */
+// Domingo de Páscoa (algoritmo de Meeus/Jones/Butcher).
+function easter(y) {
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+  const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const mo = Math.floor((h + l - 7 * m + 114) / 31), da = ((h + l - 7 * m + 114) % 31) + 1;
+  return iso(y, mo, da);
+}
+const NATIONAL = [['01-01', 'Confraternização Universal'], ['04-21', 'Tiradentes'], ['05-01', 'Dia do Trabalho'],
+  ['09-07', 'Independência'], ['10-12', 'Nossa Senhora Aparecida'], ['11-02', 'Finados'],
+  ['11-15', 'Proclamação da República'], ['11-20', 'Consciência Negra'], ['12-25', 'Natal']];
+const holCache = {};
+// Feriados do ano conforme os Ajustes: { 'AAAA-MM-DD': 'nome' }.
+function holidays(y) {
+  const c = S.cfg, sig = y + '|' + c.feriadosNac + '|' + c.feriadosFac + '|' + c.feriadosExtras;
+  if (holCache[sig]) return holCache[sig];
+  const out = {};
+  if (c.feriadosNac !== '0') {
+    NATIONAL.forEach(h => { out[y + '-' + h[0]] = h[1]; });
+    out[addDays(easter(y), -2)] = 'Sexta-feira Santa';
+  }
+  if (c.feriadosFac === '1') {
+    const p = easter(y);
+    out[addDays(p, -48)] = 'Carnaval'; out[addDays(p, -47)] = 'Carnaval'; out[addDays(p, 60)] = 'Corpus Christi';
+  }
+  extraHolidays().forEach(h => {
+    if (h.d.length === 5) out[y + '-' + h.d] = h.nome || 'Feriado';
+    else if (h.d.slice(0, 4) === String(y)) out[h.d] = h.nome || 'Feriado';
+  });
+  return (holCache[sig] = out);
+}
+function extraHolidays() {
+  try { const v = JSON.parse(S.cfg.feriadosExtras || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+function isBizDay(s, sab) {
+  const p = parse(s), wd = new Date(p.y, p.m - 1, p.d).getDay();
+  if (wd === 0 || (wd === 6 && !sab)) return false;
+  return !holidays(p.y)[s];
+}
+function bizDays(ym, sab) {
+  const y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7)), out = [];
+  for (let d = 1; d <= daysIn(y, m); d++) { const s = iso(y, m, d); if (isBizDay(s, sab)) out.push(s); }
+  return out;
+}
+const monthsBetween = (a, b) => (Number(b.slice(0, 4)) * 12 + Number(b.slice(5, 7))) - (Number(a.slice(0, 4)) * 12 + Number(a.slice(5, 7)));
+// Data e valor de uma recorrência num mês (AAAA-MM).
+function ruleOccurrence(rule, ym) {
+  const y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7)), sab = !!rule.sabado;
+  let date;
+  if (rule.diaModo === 'fixo') date = iso(y, m, Math.min(Math.max(1, rule.dia || 1), daysIn(y, m)));
+  else {
+    const bd = bizDays(ym, sab);
+    if (!bd.length) date = iso(y, m, daysIn(y, m));
+    else date = rule.diaModo === 'ultimo' ? bd[bd.length - 1] : bd[Math.min(Math.max(1, rule.dia || 1), bd.length) - 1];
+  }
+  const base = valueAt(rule, ym);
+  let valor = r2(base), dias = 0;
+  if (rule.valorModo === 'diaUtil') {
+    dias = bizDays(rule.refMes === 'proximo' ? shiftYM(ym, 1) : ym, sab).length;
+    valor = r2(base * dias);
+  }
+  const card = rule.forma === 'Crédito' ? cardById(rule.cartaoId) : null;
+  return { ym, data: date, vencimento: card ? firstDue(date, card) : date, valor, dias };
+}
+// Histórico de valores: [{desde: 'AAAA-MM', valor}]. Cada mês usa o último valor que já valia.
+function valueHist(rule) {
+  try { const v = JSON.parse(rule.valores || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+function valueAt(rule, ym) {
+  let v = Number(rule.valor) || 0;
+  const h = valueHist(rule);
+  if (h.length) { v = h[0].valor; h.forEach(x => { if (x.desde <= ym) v = x.valor; }); }
+  return Number(v) || 0;
+}
+const adjusted = rule => String(rule.ajustados || '').split(',').filter(Boolean);
+const skipped = rule => String(rule.pulados || '').split(',').filter(Boolean);
+// Meses que a regra deve ter lançamento: do início até 12 meses à frente (ou até o fim).
+function ruleMonths(rule) {
+  const last = shiftYM(today().slice(0, 7), 12), end = rule.fim && rule.fim < last ? rule.fim : last, skip = skipped(rule), out = [];
+  for (let ym = rule.inicio; ym && ym <= end; ym = shiftYM(ym, 1)) if (skip.indexOf(ym) < 0) out.push(ym);
+  return out;
+}
+function ruleRow(rule, o, status) {
+  return { id: rule.id + '-' + o.ym, data: o.data, descricao: rule.descricao, tipo: rule.tipo, categoria: rule.categoria, valor: o.valor,
+    forma: rule.forma, cartaoId: rule.forma === 'Crédito' ? rule.cartaoId : '', modo: 'recorrente', parcela: monthsBetween(rule.inicio, o.ym) + 1, total: 0,
+    grupo: rule.id, vencimento: o.vencimento, status: status || 'Pendente', obs: rule.obs || '', criadoEm: new Date().toISOString() };
+}
+// Compara os lançamentos de cada recorrência com o que a regra pede e devolve as alterações.
+// update=false só cria os meses que faltam; update=true também ajusta ou apaga os pendentes
+// a partir deste mês (depois de editar a regra ou os feriados). Pagos nunca são alterados.
+function ruleOps(rules, update, paidUntil) {
+  const cur = today().slice(0, 7), adds = [], patches = [], dels = [];
+  rules.forEach(rule => {
+    const have = {};
+    S.tx.forEach(r => { if (r.grupo === rule.id) have[r.id] = r; });
+    const want = {};
+    ruleMonths(rule).forEach(ym => {
+      const o = ruleOccurrence(rule, ym), row = ruleRow(rule, o, paidUntil && o.vencimento <= paidUntil ? 'Pago' : 'Pendente');
+      want[row.id] = true;
+      const r = have[row.id];
+      if (!r) adds.push(row);
+      else if (update && r.status !== 'Pago' && ym >= cur && adjusted(rule).indexOf(ym) < 0) {
+        const p = { id: r.id }; let ch = false;
+        ['data', 'vencimento', 'valor', 'descricao', 'tipo', 'categoria', 'forma', 'cartaoId', 'obs'].forEach(k => { if (r[k] !== row[k]) { p[k] = row[k]; ch = true; } });
+        if (ch) patches.push(p);
+      }
+    });
+    if (update) Object.keys(have).forEach(id => { const r = have[id]; if (!want[id] && r.status !== 'Pago' && r.vencimento.slice(0, 7) >= cur) dels.push(id); });
+  });
+  return { adds, patches, dels };
+}
+function applyRuleOps(o) {
+  if (o.dels.length) S.tx = S.tx.filter(x => o.dels.indexOf(x.id) < 0);
+  o.patches.forEach(p => { const r = S.tx.find(x => x.id === p.id); if (r) Object.assign(r, p); });
+  o.adds.forEach(r => S.tx.push(r));
+}
+function ruleOpsList(o) {
+  const ops = [];
+  if (o.adds.length) ops.push(['addTx', o.adds]);
+  if (o.patches.length) ops.push(['updateTx', o.patches]);
+  if (o.dels.length) ops.push(['deleteTx', o.dels]);
+  return ops;
+}
+// Cria os meses que faltam (ex.: virou o mês). Roda sempre que os dados chegam.
+function topUpRules() {
+  if (!S.rules.length) return;
+  const o = ruleOps(S.rules.filter(r => !r.fim || r.fim >= r.inicio), false);
+  if (o.adds.length) commit(() => applyRuleOps(o), ruleOpsList(o));
+}
+function ruleWhen(rule) {
+  const sab = rule.sabado ? ' (com sábado)' : '';
+  if (rule.diaModo === 'fixo') return 'todo dia ' + rule.dia;
+  if (rule.diaModo === 'ultimo') return 'último dia útil' + sab;
+  return rule.dia + 'º dia útil' + sab;
+}
+function ruleValueTxt(rule) {
+  const v = valueAt(rule, today().slice(0, 7));
+  if (rule.valorModo !== 'diaUtil') return fmt(v);
+  return fmt(v) + ' por dia útil' + (rule.refMes === 'proximo' ? ' do mês seguinte' : '');
+}
+
 function parseMoney(str) {
   let s = String(str || '').replace(/[^\d,.\-]/g, '');
   if (s.indexOf(',') > -1) s = s.replace(/\./g, '').replace(',', '.');
@@ -112,7 +256,7 @@ function parseMoney(str) {
    Estado e comunicação com o servidor
    ===================================================================== */
 const S = {
-  cfg: { saldoInicial: 0, dataInicio: '' }, cards: [], cats: [], tx: [], ssUrl: '',
+  cfg: { saldoInicial: 0, dataInicio: '' }, cards: [], cats: [], tx: [], rules: [], ssUrl: '', serverV: 1,
   view: 'fluxo', month: today().slice(0, 7),
   lMode: 'data', lq: '', lTipo: '', lCat: '', lStatus: '',
   fRange: 90, aScope: 'mes', aBasis: 'venc'
@@ -156,9 +300,10 @@ async function call(action, args, c) {
   return j.data;
 }
 function applyData(d) {
-  S.cfg = d.cfg || { saldoInicial: 0, dataInicio: '' }; S.cards = d.cards || []; S.cats = d.cats || []; S.tx = d.tx || []; S.ssUrl = d.ssUrl || '';
+  S.cfg = d.cfg || { saldoInicial: 0, dataInicio: '' }; S.cards = d.cards || []; S.cats = d.cats || []; S.tx = d.tx || [];
+  S.rules = d.rules || []; S.ssUrl = d.ssUrl || ''; S.serverV = d.v || 1;
 }
-const snapshot = () => ({ cfg: S.cfg, cards: S.cards, cats: S.cats, tx: S.tx, ssUrl: S.ssUrl });
+const snapshot = () => ({ v: S.serverV, cfg: S.cfg, cards: S.cards, cats: S.cats, tx: S.tx, rules: S.rules, ssUrl: S.ssUrl });
 function saveLocal() { LS.set('data', snapshot()); LS.set('queue', queue); }
 
 // Aplica a mudança na tela na hora, guarda no aparelho e envia à planilha.
@@ -205,6 +350,7 @@ async function refresh(force) {
     if (edits !== before || queue.length) return; // houve alteração enquanto carregava
     const changed = JSON.stringify(d) !== JSON.stringify(snapshot());
     applyData(d); saveLocal(); syncErr = ''; paintSync();
+    topUpRules();
     if (changed || force) render();
   } catch (e) {
     if (e instanceof AuthError) return showConnect(e.message);
@@ -366,7 +512,8 @@ function viewFluxo() {
       <p>Informe o saldo atual das suas contas, cadastre seus cartões e registre o primeiro lançamento.<br>Em seguida este painel mostra o saldo dos próximos dias.</p>
       <button class="btn primary" data-act="settings">Informar saldo inicial</button>
       <button class="btn" data-act="cardnew">Cadastrar cartão</button>
-      <button class="btn" data-act="new">Novo lançamento</button></div>`;
+      <button class="btn" data-act="new">Novo lançamento</button>
+      <button class="btn" data-act="rulenew">Nova receita ou despesa fixa</button></div>`;
   }
   const t = today(), hoje = saldoHoje(), rw = runway(S.fRange), evs = pendingEvents();
   const lim30 = addDays(t, 30);
@@ -419,10 +566,26 @@ function viewFluxo() {
     ${rows ? `<div class="ev head"><span>Data</span><span>O quê</span><span style="text-align:right">Valor</span><span class="bal" style="text-align:right">Saldo depois</span><span></span></div>${rows}`
       : `<div class="empty"><h3>Nada pendente neste período</h3><p>Lançamentos com vencimento futuro aparecem aqui.</p></div>`}
   </div>
+  ${rulesPanel()}
   <div class="panel"><div class="panel-h"><h2>Mês a mês</h2><span class="hint">Por data de vencimento, pagos e pendentes. Cada mês parte do saldo final do anterior.</span></div>
     <div class="scrollx"><table class="mtab"><thead><tr><th>Mês</th><th>Saldo inicial</th><th>Entradas</th><th>Saídas</th><th>Saldo final</th></tr></thead><tbody>
     ${mt.map(m => `<tr class="${m.ym === nowYM ? 'now' : ''}"><td>${cap(monthName(m.ym))} ${m.ym.slice(0, 4)}</td><td>${fmt(m.open)}</td><td class="pos">${fmt(m.rec)}</td><td class="neg">${fmt(m.des)}</td><td class="${m.close < 0 ? 'neg' : ''}"><b>${fmt(m.close)}</b></td></tr>`).join('')}
     </tbody></table></div></div>`;
+}
+function rulesPanel() {
+  const cur = today().slice(0, 7), t = today();
+  const rules = S.rules.slice().sort((a, b) => (a.tipo === b.tipo ? a.descricao.localeCompare(b.descricao) : a.tipo === 'Receita' ? -1 : 1));
+  const rows = rules.map(r => {
+    const ended = r.fim && r.fim < cur;
+    const next = S.tx.filter(x => x.grupo === r.id && x.status !== 'Pago' && x.vencimento >= t).sort((a, b) => (a.vencimento < b.vencimento ? -1 : 1))[0];
+    const fim = r.fim ? (ended ? `encerrada em ${monthName(r.fim)}/${r.fim.slice(2, 4)}` : `até ${monthName(r.fim)}/${r.fim.slice(2, 4)}`) : 'sem fim';
+    return `<div class="row" data-act="ruleedit" data-id="${r.id}" style="${ended ? 'opacity:.55' : ''}">
+      <span class="dot" style="width:12px;height:12px;margin:0 auto;background:${catColor(r.categoria)}"></span>
+      <div style="min-width:0"><div class="ttl">${esc(r.descricao)}</div><div class="meta"><span>${esc(r.categoria)}</span><span>${esc(ruleWhen(r))}</span><span>${esc(ruleValueTxt(r))}</span><span class="tag ${ended ? '' : 'info'}">${fim}</span></div></div>
+      <div class="amt ${r.tipo === 'Receita' ? 'pos' : ''}">${next ? (r.tipo === 'Receita' ? '+' : '−') + fmt(next.valor) + `<small>próximo ${dm(next.vencimento)}</small>` : '<small>—</small>'}</div></div>`;
+  }).join('');
+  return `<div class="panel"><div class="panel-h"><h2>Receitas e despesas fixas</h2><button class="btn sm" data-act="rulenew">${icon('plus', 16)} Nova fixa</button></div>
+    ${rows || '<div class="empty" style="padding:18px"><p>Salário, benefícios, aluguel, assinaturas: cadastre uma vez e eles entram todo mês sozinhos.</p></div>'}</div>`;
 }
 function drawFluxoCharts() {
   const rw = runway(S.fRange);
@@ -471,7 +634,7 @@ function lancRow(i) {
   meta.push(`<span>${r.forma === 'Crédito' ? 'Crédito · ' + esc(cardName(r.cartaoId)) : esc(r.forma)}</span>`);
   if (isGroup) meta.push(`<span class="tag info">${i.grp.n}× ${fmt(r.valor)}</span><span>${i.grp.paid} de ${i.grp.n} pagas</span>`);
   else if (r.modo === 'parcelada') meta.push(`<span class="tag info">parcela ${r.parcela}/${r.total}</span>`);
-  else if (r.modo === 'recorrente') meta.push(`<span class="tag">mensal ${r.parcela}/${r.total}</span>`);
+  else if (r.modo === 'recorrente') meta.push(`<span class="tag">${r.total ? `mensal ${r.parcela}/${r.total}` : 'todo mês'}</span>`);
   if (S.lMode === 'data' && !isGroup && r.vencimento !== r.data) meta.push(`<span>vence ${dm(r.vencimento)}</span>`);
   if (S.lMode === 'venc' && r.data !== r.vencimento && r.modo !== 'recorrente') meta.push(`<span>compra em ${dm(r.data)}</span>`);
   const chk = isGroup
@@ -667,7 +830,7 @@ function drawAnaliseCharts() {
 function openDrawer() { $('#scrim').hidden = false; $('#drawer').hidden = false; }
 function closeDrawer() { $('#scrim').hidden = true; $('#drawer').hidden = true; $('#drawer').innerHTML = ''; }
 
-function formHTML(b, edit, gcount) {
+function formHTML(b, edit, gcount, rule) {
   return `<h2>${edit ? 'Editar lançamento' : 'Novo lançamento'}<button class="icon-btn" type="button" data-act="closeDrawer" aria-label="Fechar">${icon('x')}</button></h2>
   <form id="txForm" novalidate autocomplete="off">
     <div class="seg seg-wide" style="margin-bottom:16px" role="group" aria-label="Tipo">
@@ -683,6 +846,8 @@ function formHTML(b, edit, gcount) {
     </div>
     <fieldset class="field"><legend>Forma de pagamento</legend><div class="chips" id="formas"></div></fieldset>
     <label class="field" id="cardBox" hidden><span>Cartão</span><select name="cartaoId"></select></label>
+    ${rule ? `<div class="preview">Este é o mês de ${monthLabel(row_ym(b, rule))} de uma recorrência (${esc(ruleWhen(rule))}, ${esc(ruleValueTxt(rule))}). Mudanças aqui valem só para este mês (ex.: pagar este mês no crédito).
+      <div style="margin-top:8px"><button type="button" class="btn sm" data-act="ruleedit" data-id="${rule.id}">Editar a recorrência inteira</button></div></div>` : ''}
     ${edit ? (gcount > 1 ? `<p class="mut" style="margin:0 0 12px">${b.modo === 'parcelada' ? 'Parcela' : 'Lançamento'} ${b.parcela} de ${b.total}.</p>` : '') : `
     <div class="field"><span>Repetição</span>
       <div class="seg seg-wide" id="modoSeg" role="group" aria-label="Repetição"><button type="button" data-modo="unica" class="on">À vista</button><button type="button" data-modo="parcelada">Parcelado</button><button type="button" data-modo="recorrente">Todo mês</button></div></div>
@@ -707,12 +872,14 @@ function formHTML(b, edit, gcount) {
   </form>`;
 }
 
+const row_ym = (r, rule) => r.id.slice(rule.id.length + 1);
 function openForm(row) {
   const edit = !!row, t0 = today();
   const b = row ? Object.assign({}, row) : { tipo: 'Despesa', descricao: '', valor: '', categoria: '', data: t0, forma: 'Pix', cartaoId: '', vencimento: t0, status: 'Pago', obs: '', modo: 'unica', parcela: 1, total: 1 };
-  const grp = edit && row.modo !== 'unica' ? S.tx.filter(x => x.grupo === row.grupo) : [];
+  const rule = edit && row.modo === 'recorrente' ? S.rules.find(k => k.id === row.grupo) : null;
+  const grp = edit && row.modo !== 'unica' && !rule ? S.tx.filter(x => x.grupo === row.grupo) : [];
   const drawer = $('#drawer');
-  drawer.innerHTML = formHTML(b, edit, grp.length);
+  drawer.innerHTML = formHTML(b, edit, grp.length, rule);
   openDrawer();
   const form = $('#txForm'), E = form.elements;
   let dueTouched = edit, pagoTouched = edit, chipsTipo = null, wantForma = b.forma;
@@ -808,6 +975,14 @@ function openForm(row) {
     const tb = e.target.closest('button[data-tipo]');
     if (tb) { E.tipo.value = tb.dataset.tipo; chipsTipo = null; E.categoria.value = ''; sync(); return; }
     const mb = e.target.closest('button[data-modo]');
+    if (mb && mb.dataset.modo === 'recorrente') {
+      // "Todo mês" vira uma recorrência: leva o que já foi digitado para o formulário dela.
+      const due = E.vencimento.value || E.data.value || t0;
+      openRuleForm(null, { tipo: E.tipo.value, valor: parseMoney(E.valor.value) || '', descricao: E.descricao.value.trim(),
+        categoria: E.categoria.value === '__new' ? '' : E.categoria.value, forma: E.forma.value, cartaoId: E.cartaoId.value,
+        dia: Number(due.slice(8, 10)), obs: E.obs.value.trim() });
+      return;
+    }
     if (mb) { E.modo.value = mb.dataset.modo; sync(); }
   });
   form.addEventListener('input', e => {
@@ -815,6 +990,8 @@ function openForm(row) {
     // escolha de "+ Nova categoria…" antes de o 'change' acontecer.
     if (e.target === E.categoria) return;
     if (e.target === E.vencimento) dueTouched = true;
+    // Trocou a forma ou o cartão (ex.: este mês foi no crédito): o vencimento passa a ser o da fatura.
+    if (edit && (e.target.name === 'forma' || e.target === E.cartaoId)) dueTouched = false;
     if (e.target === E.pago) pagoTouched = true;
     sync();
   });
@@ -854,7 +1031,14 @@ function openForm(row) {
         grp.forEach(g => { if (g.id !== row.id) patches.push({ id: g.id, descricao: desc, tipo, categoria: patch.categoria, forma, cartaoId }); });
       }
       closeDrawer();
-      commit(() => patches.forEach(p => { const r = S.tx.find(x => x.id === p.id); if (r) Object.assign(r, p); }), ['updateTx', patches]);
+      const ops = [['updateTx', patches]];
+      let ruleUpd = null;
+      if (rule) {
+        // Este mês foi ajustado à mão: a recorrência não mexe mais nele.
+        const ym = row_ym(row, rule), aj = adjusted(rule);
+        if (aj.indexOf(ym) < 0) { ruleUpd = Object.assign({}, rule, { ajustados: aj.concat([ym]).join(',') }); ops.push(['saveRule', ruleUpd]); }
+      }
+      commit(() => { patches.forEach(p => { const r = S.tx.find(x => x.id === p.id); if (r) Object.assign(r, p); }); if (ruleUpd) Object.assign(rule, ruleUpd); }, ops);
       toast('Lançamento atualizado');
       return;
     }
@@ -877,7 +1061,209 @@ function openForm(row) {
   form._saveMore = () => submit(true);
 }
 
+/* =====================================================================
+   Recorrências (todo mês, com ou sem fim)
+   ===================================================================== */
+function monthOptions(sel, from, n) {
+  let h = '';
+  for (let i = 0; i < n; i++) { const ym = shiftYM(from, i); h += `<option value="${ym}" ${ym === sel ? 'selected' : ''}>${monthLabel(ym)}</option>`; }
+  return h;
+}
+function openRuleForm(rule, pre) {
+  const edit = !!rule, t0 = today(), cur = t0.slice(0, 7);
+  pre = pre || {};
+  const b = rule ? Object.assign({}, rule, { valor: valueAt(rule, cur < rule.inicio ? rule.inicio : cur) }) : {
+    id: '', tipo: pre.tipo || 'Despesa', descricao: pre.descricao || '', categoria: pre.categoria || '', forma: pre.forma || 'Pix', cartaoId: pre.cartaoId || '',
+    valor: pre.valor || '', valorModo: 'fixo', refMes: 'mesmo', diaModo: 'fixo', dia: pre.dia || Number(t0.slice(8, 10)), sabado: false,
+    inicio: cur, fim: '', pulados: '', obs: pre.obs || ''
+  };
+  const chips = (name, opts, val) => `<div class="chips">${opts.map(o => `<label><input type="radio" name="${name}" value="${o[0]}" ${o[0] === val ? 'checked' : ''}><span>${o[1]}</span></label>`).join('')}</div>`;
+  const startFrom = shiftYM(b.inicio < cur ? b.inicio : cur, -12);
+  $('#drawer').innerHTML = `<h2>${edit ? 'Editar fixa' : 'Nova receita ou despesa fixa'}<button class="icon-btn" type="button" data-act="closeDrawer" aria-label="Fechar">${icon('x')}</button></h2>
+  <form id="ruleForm" novalidate autocomplete="off">
+    <p class="mut" style="margin:-6px 0 14px;font-size:13.5px">Um lançamento por mês, criado sozinho. Sem data de fim, ele continua até você encerrar.</p>
+    <div class="seg seg-wide" style="margin-bottom:16px" role="group" aria-label="Tipo">
+      <button type="button" data-tipo="Despesa" class="${b.tipo === 'Despesa' ? 'on' : ''}">Despesa</button>
+      <button type="button" data-tipo="Receita" class="${b.tipo === 'Receita' ? 'on' : ''}">Receita</button>
+    </div>
+    <input type="hidden" name="tipo" value="${b.tipo}">
+    <fieldset class="field"><legend>Valor</legend>${chips('valorModo', [['fixo', 'Fixo todo mês'], ['diaUtil', 'Por dia útil']], b.valorModo)}</fieldset>
+    <label class="field"><span id="valLabel">Valor</span><div class="money"><i>R$</i><input name="valor" inputmode="decimal" placeholder="0,00" value="${b.valor === '' ? '' : String(b.valor).replace('.', ',')}"></div></label>
+    ${edit ? `<label class="field" id="desdeBox" hidden><span>O novo valor vale a partir de</span><select name="desde">${monthOptions(cur < b.inicio ? b.inicio : cur, cur < b.inicio ? b.inicio : cur, 25)}</select></label>` : ''}
+    <fieldset class="field" id="refBox"><legend>Contar os dias úteis de</legend>${chips('refMes', [['mesmo', 'O próprio mês'], ['proximo', 'O mês seguinte']], b.refMes)}</fieldset>
+    <label class="field"><span>Descrição</span><input type="text" name="descricao" placeholder="Ex.: Salário" value="${esc(b.descricao)}"></label>
+    <label class="field"><span>Categoria</span><select name="categoria"></select></label>
+    <fieldset class="field"><legend>Forma de pagamento</legend><div class="chips" id="rFormas"></div></fieldset>
+    <label class="field" id="rCardBox" hidden><span>Cartão</span><select name="cartaoId"></select></label>
+    <fieldset class="field"><legend id="whenLabel">Quando cai</legend>${chips('diaModo', [['fixo', 'Dia fixo'], ['util', 'Nº dia útil'], ['ultimo', 'Último dia útil']], b.diaModo)}</fieldset>
+    <label class="field" id="diaBox"><span id="diaLabel">Dia do mês</span><input type="number" name="dia" min="1" max="31" value="${b.dia || 1}" inputmode="numeric"></label>
+    <label class="ck" id="sabBox"><input type="checkbox" name="sabado" ${b.sabado ? 'checked' : ''}><span>Sábado conta como dia útil</span></label>
+    <div class="row2">
+      <label class="field"><span>Começa em</span><select name="inicio">${monthOptions(b.inicio, startFrom, 48)}</select></label>
+      <label class="field"><span>Termina</span><select name="fim"><option value="">Sem data de fim</option>${monthOptions(b.fim, startFrom, 84)}</select></label>
+    </div>
+    ${edit ? '' : `<label class="ck"><input type="checkbox" name="pago"><span id="rPagoLabel">Já recebi os meses que já passaram</span></label>`}
+    <label class="field"><span>Observação (opcional)</span><input type="text" name="obs" value="${esc(b.obs)}"></label>
+    <div class="preview" id="rPreview"></div>
+    <p class="formerr" id="rErr" role="alert"></p>
+    <div class="actions">
+      ${edit ? `<button type="button" class="btn danger" data-x="del">Excluir</button><button type="button" class="btn" data-x="end">Encerrar</button>` : ''}
+      <button type="submit" class="btn primary">Salvar</button>
+    </div>
+  </form>`;
+  openDrawer();
+  const f = $('#ruleForm'), E = f.elements;
+  let formasTipo = null, wantForma = b.forma;
+  function fillCats() {
+    const list = S.cats.filter(c => c.tipo === E.tipo.value).map(c => c.nome);
+    const curC = E.categoria.value || (b.tipo === E.tipo.value ? b.categoria : '');
+    if (curC && curC !== '__new' && list.indexOf(curC) < 0) list.push(curC);
+    E.categoria.innerHTML = list.map(n => `<option>${esc(n)}</option>`).join('') + '<option value="__new">+ Nova categoria…</option>';
+    E.categoria.value = list.indexOf(curC) > -1 ? curC : (list[0] || '__new');
+  }
+  function fillFormas() {
+    if (formasTipo === E.tipo.value) return;
+    formasTipo = E.tipo.value;
+    const list = formasTipo === 'Despesa' ? FORMAS_D : FORMAS_R, pick = list.indexOf(wantForma) > -1 ? wantForma : list[0];
+    $('#rFormas').innerHTML = list.map(x => `<label><input type="radio" name="forma" value="${x}" ${x === pick ? 'checked' : ''}><span>${x}</span></label>`).join('');
+  }
+  function fillCards() {
+    const sel = E.cartaoId, c0 = sel.value || b.cartaoId, list = activeCards().slice();
+    if (c0 && !list.some(c => c.id === c0) && cardById(c0)) list.push(cardById(c0));
+    sel.innerHTML = list.length ? list.map(c => `<option value="${c.id}">${esc(c.nome)}</option>`).join('') : '<option value="">Cadastre um cartão em Cartões</option>';
+    if (c0 && list.some(c => c.id === c0)) sel.value = c0;
+  }
+  function read() {
+    return {
+      id: b.id || uid(), descricao: E.descricao.value.trim(), tipo: E.tipo.value, categoria: E.categoria.value,
+      forma: E.forma.value, cartaoId: E.forma.value === 'Crédito' ? E.cartaoId.value : '',
+      valor: parseMoney(E.valor.value), valorModo: E.valorModo.value, refMes: E.refMes.value,
+      diaModo: E.diaModo.value, dia: Math.floor(Number(E.dia.value)) || 0, sabado: E.sabado.checked,
+      inicio: E.inicio.value, fim: E.fim.value, pulados: b.pulados || '', ajustados: b.ajustados || '', valores: b.valores || '', obs: E.obs.value.trim(), criadoEm: b.criadoEm || new Date().toISOString()
+    };
+  }
+  function sync() {
+    fillCats(); fillFormas();
+    $$('#ruleForm button[data-tipo]').forEach(x => x.classList.toggle('on', x.dataset.tipo === E.tipo.value));
+    const forma = E.forma.value, porDia = E.valorModo.value === 'diaUtil', dm = E.diaModo.value;
+    wantForma = forma;
+    $('#rCardBox').hidden = forma !== 'Crédito';
+    if (forma === 'Crédito') fillCards();
+    $('#valLabel').textContent = porDia ? 'Valor por dia útil' : 'Valor por mês';
+    $('#refBox').hidden = !porDia;
+    if (edit) $('#desdeBox').hidden = parseMoney(E.valor.value) === r2(b.valor);
+    $('#diaBox').hidden = dm === 'ultimo';
+    $('#diaLabel').textContent = dm === 'util' ? 'Qual dia útil (ex.: 5 para o 5º dia útil)' : 'Dia do mês';
+    E.dia.max = dm === 'util' ? 23 : 31;
+    $('#sabBox').hidden = dm === 'fixo' && !porDia;
+    $('#whenLabel').textContent = E.tipo.value === 'Receita' ? 'Quando cai na conta' : (forma === 'Crédito' ? 'Dia da cobrança no cartão' : 'Quando vence');
+    if (E.pago) $('#rPagoLabel').textContent = E.tipo.value === 'Receita' ? 'Já recebi os meses que já passaram' : 'Já paguei os meses que já passaram';
+    // prévia dos próximos meses
+    const r = read();
+    if (!(r.valor > 0) || !r.inicio || (r.diaModo !== 'ultimo' && !(r.dia >= 1))) { $('#rPreview').innerHTML = ''; return; }
+    const months = ruleMonths(Object.assign({}, r, { pulados: '' })).filter(ym => ym >= (r.inicio > cur ? r.inicio : cur)).slice(0, 4);
+    if (!months.length) { $('#rPreview').innerHTML = r.fim && r.fim < r.inicio ? '' : 'Nenhum mês a partir de agora.'; return; }
+    const lines = months.map(ym => {
+      const o = ruleOccurrence(r, ym);
+      return `<div>${dmy(o.vencimento)} · <b>${fmt(o.valor)}</b>${r.valorModo === 'diaUtil' ? ` <span class="mut">(${o.dias} dias úteis de ${monthName(r.refMes === 'proximo' ? shiftYM(ym, 1) : ym)})</span>` : ''}</div>`;
+    }).join('');
+    $('#rPreview').innerHTML = `<b>Próximos:</b>${lines}<div class="mut" style="margin-top:4px">${r.fim ? 'Último mês: ' + monthName(r.fim) + ' de ' + r.fim.slice(0, 4) + '.' : 'Sem data de fim.'}</div>`;
+  }
+  sync();
+  setTimeout(() => { try { (edit ? E.descricao : E.valor).focus(); } catch (e) { /* ok */ } }, 30);
+
+  f.addEventListener('click', async e => {
+    const tb = e.target.closest('button[data-tipo]');
+    if (tb) { E.tipo.value = tb.dataset.tipo; formasTipo = null; E.categoria.value = ''; sync(); return; }
+    const x = e.target.closest('[data-x]');
+    if (!x) return;
+    if (x.dataset.x === 'end') {
+      E.fim.value = cur; sync();
+      $('#rErr').textContent = '';
+      $('#rPreview').insertAdjacentHTML('afterbegin', `<div style="margin-bottom:6px"><b>Encerrando:</b> ${monthLabel(cur)} fica como último mês. Os meses seguintes que ainda não foram pagos serão apagados. Confira e clique em Salvar.</div>`);
+      return;
+    }
+    if (x.dataset.x === 'del') {
+      const rows = S.tx.filter(t => t.grupo === rule.id), pagos = rows.filter(t => t.status === 'Pago');
+      const ch = await confirmBox('Excluir esta fixa?', pagos.length
+        ? `Você pode apagar só o que está pendente e manter no histórico os ${pagos.length} meses já pagos, ou apagar tudo.`
+        : 'Os lançamentos desta recorrência serão apagados.',
+        pagos.length ? [{ label: 'Cancelar', value: null }, { label: 'Manter os pagos', value: 'keep', kind: 'danger' }, { label: 'Apagar tudo', value: 'all', kind: 'danger solid' }]
+          : [{ label: 'Cancelar', value: null }, { label: 'Excluir', value: 'all', kind: 'danger solid' }]);
+      if (!ch) return;
+      const ids = rows.filter(t => ch === 'all' || t.status !== 'Pago').map(t => t.id);
+      closeDrawer();
+      commit(() => { S.rules = S.rules.filter(k => k.id !== rule.id); S.tx = S.tx.filter(t => ids.indexOf(t.id) < 0); },
+        ids.length ? [['deleteRule', rule.id], ['deleteTx', ids]] : ['deleteRule', rule.id]);
+      toast('Fixa excluída');
+    }
+  });
+  f.addEventListener('input', e => { if (e.target !== E.categoria) sync(); });
+  f.addEventListener('change', async e => {
+    if (e.target === E.categoria && E.categoria.value === '__new') {
+      const name = await promptBox('Nova categoria', 'Nome da categoria', '');
+      const n = (name || '').trim();
+      if (n) {
+        if (!S.cats.some(c => c.nome === n && c.tipo === E.tipo.value)) {
+          const cat = { nome: n, tipo: E.tipo.value, cor: PALETTE[S.cats.length % PALETTE.length] };
+          commit(() => S.cats.push(cat), ['saveCats', S.cats.concat([cat])]);
+        }
+        b.categoria = n; b.tipo = E.tipo.value; E.categoria.value = '';
+      } else E.categoria.value = '';
+    }
+    sync();
+  });
+  f.addEventListener('submit', e => {
+    e.preventDefault();
+    const err = m => { $('#rErr').textContent = m; };
+    if (S.serverV < 2) return err('Atualize o script da planilha para usar recorrências (veja o README, passo "Atualizar o script").');
+    const r = read();
+    if (!(r.valor > 0)) return err('Informe um valor maior que zero.');
+    if (!r.descricao) return err('Escreva uma descrição.');
+    if (!r.categoria || r.categoria === '__new') return err('Escolha uma categoria.');
+    if (r.forma === 'Crédito' && !r.cartaoId) return err('Escolha o cartão.');
+    if (r.diaModo === 'fixo' && !(r.dia >= 1 && r.dia <= 31)) return err('O dia do mês vai de 1 a 31.');
+    if (r.diaModo === 'util' && !(r.dia >= 1 && r.dia <= 23)) return err('O dia útil vai de 1 a 23.');
+    if (r.fim && r.fim < r.inicio) return err('O mês de término não pode ser antes do início.');
+    if (r.diaModo === 'ultimo') r.dia = 0;
+    if (r.valorModo !== 'diaUtil') r.refMes = 'mesmo';
+    if (r.diaModo === 'fixo' && r.valorModo !== 'diaUtil') r.sabado = false;
+    if (edit && r.valor !== r2(b.valor)) {
+      // Valor novo só a partir do mês escolhido; os anteriores ficam com o valor antigo.
+      const desde = E.desde.value, h = valueHist(rule).filter(x => x.desde < desde);
+      if (!h.length) h.push({ desde: rule.inicio, valor: Number(rule.valor) || 0 });
+      h.push({ desde, valor: r.valor });
+      r.valores = JSON.stringify(h);
+    }
+    const o = ruleOps([r], true, !edit && E.pago.checked ? t0 : '');
+    closeDrawer();
+    commit(() => {
+      const i = S.rules.findIndex(k => k.id === r.id);
+      if (i > -1) S.rules[i] = r; else S.rules.push(r);
+      applyRuleOps(o);
+    }, [['saveRule', r]].concat(ruleOpsList(o)));
+    toast(edit ? 'Fixa atualizada' : `Fixa criada · ${o.adds.length} ${o.adds.length > 1 ? 'meses lançados' : 'mês lançado'}`);
+  });
+}
+
 async function deleteRow(r) {
+  const rule = r.modo === 'recorrente' && S.rules.find(k => k.id === r.grupo);
+  if (rule) {
+    const ym = r.id.slice(rule.id.length + 1);
+    const ch = await confirmBox('Excluir qual parte?', `${r.descricao} se repete todo mês.`, [
+      { label: 'Cancelar', value: null },
+      { label: 'Só este mês', value: 'one', kind: 'danger' },
+      { label: 'Este e os próximos (encerrar)', value: 'next', kind: 'danger solid' }]);
+    if (!ch) return;
+    const upd = Object.assign({}, rule);
+    if (ch === 'one') upd.pulados = skipped(rule).concat([ym]).join(',');
+    else upd.fim = shiftYM(ym, -1);
+    const ids = ch === 'one' ? [r.id] : S.tx.filter(t => t.grupo === rule.id && t.status !== 'Pago' && t.id.slice(rule.id.length + 1) >= ym).map(t => t.id).concat(r.status === 'Pago' ? [r.id] : []);
+    closeDrawer();
+    commit(() => { Object.assign(rule, upd); S.tx = S.tx.filter(x => ids.indexOf(x.id) < 0); }, [['saveRule', upd], ['deleteTx', ids]]);
+    toast(ch === 'one' ? 'Mês excluído' : 'Fixa encerrada');
+    return;
+  }
   const grp = r.modo !== 'unica' ? S.tx.filter(x => x.grupo === r.grupo).sort((a, b) => (a.vencimento < b.vencimento ? -1 : 1)) : [r];
   let ids;
   if (grp.length <= 1) {
@@ -979,6 +1365,9 @@ function cardModal(card) {
 }
 function settingsModal() {
   const cats = S.cats.map(c => Object.assign({}, c));
+  const extras = extraHolidays().map(h => Object.assign({}, h));
+  const hDate = d => (d.length === 5 ? d.slice(3, 5) + '/' + d.slice(0, 2) + ' (todo ano)' : dmy(d));
+  const drawHol = () => `<div class="catlist">${extras.map((h, i) => `<span class="tag">${esc(hDate(h.d))} · ${esc(h.nome || 'Feriado')}<button type="button" data-hrm="${i}" aria-label="Remover">×</button></span>`).join('') || '<span class="mut" style="font-size:13px">Nenhum feriado da cidade cadastrado.</span>'}</div>`;
   const draw = () => ['Despesa', 'Receita'].map(tp => `<fieldset class="field"><legend>Categorias de ${tp === 'Despesa' ? 'despesa' : 'receita'}</legend><div class="catlist">${cats.map((c, i) => c.tipo === tp ? `<span class="tag"><i class="dot" style="background:${c.cor};margin:0"></i>${esc(c.nome)}<button type="button" data-rm="${i}" aria-label="Remover ${esc(c.nome)}">×</button></span>` : '').join('')}</div>
     <div class="catadd"><input type="text" placeholder="Nova categoria" data-new="${tp}" aria-label="Nova categoria de ${tp}"><button type="button" class="btn sm" data-add="${tp}">Adicionar</button></div></fieldset>`).join('');
   showModal(`<h2>Ajustes</h2>
@@ -989,6 +1378,14 @@ function settingsModal() {
       </div>
       <p class="mut" style="font-size:13px;margin:-4px 0 14px">O saldo de hoje = este saldo + tudo que foi pago/recebido a partir da data de início.</p>
       <div id="catArea">${draw()}</div>
+      <fieldset class="field"><legend>Feriados (para contar dias úteis)</legend>
+        <label class="ck" style="margin-bottom:6px"><input type="checkbox" name="fNac" ${S.cfg.feriadosNac !== '0' ? 'checked' : ''}><span>Feriados nacionais <small>(inclui Sexta-feira Santa)</small></span></label>
+        <label class="ck"><input type="checkbox" name="fFac" ${S.cfg.feriadosFac === '1' ? 'checked' : ''}><span>Carnaval e Corpus Christi também</span></label>
+        <div id="holArea">${drawHol()}</div>
+        <div class="catadd"><input type="text" name="hData" placeholder="DD/MM ou DD/MM/AAAA" style="flex:0 0 150px" aria-label="Data do feriado"><input type="text" name="hNome" placeholder="Nome (ex.: Aniversário da cidade)" aria-label="Nome do feriado"><button type="button" class="btn sm" data-hadd="1">Adicionar</button></div>
+        <p class="mut" style="font-size:13px;margin:-6px 0 0">DD/MM repete todo ano; com o ano, vale só naquela data.</p>
+        <p class="formerr" id="hErr"></p>
+      </fieldset>
       <fieldset class="field"><legend>Dados</legend>
         <p class="mut" style="font-size:13px;margin:0 0 10px">Os lançamentos ficam na planilha Google${S.ssUrl ? ` (<a href="${esc(S.ssUrl)}" target="_blank" rel="noopener">abrir</a>)` : ''}, que ganha uma cópia de segurança por dia no Drive.</p>
         <button type="button" class="btn sm" data-act="export">Baixar cópia (JSON)</button>
@@ -1005,18 +1402,51 @@ function settingsModal() {
     redraw();
     f.querySelector(`[data-new="${tp}"]`).focus();
   };
+  const addHol = () => {
+    const E = f.elements, v = E.hData.value.trim(), m = v.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?$/);
+    $('#hErr').textContent = '';
+    if (!m) { $('#hErr').textContent = 'Use DD/MM ou DD/MM/AAAA.'; return; }
+    const d = Number(m[1]), mo = Number(m[2]), y = m[3] ? Number(m[3]) : 2000;
+    if (!(mo >= 1 && mo <= 12 && d >= 1 && d <= daysIn(y, mo))) { $('#hErr').textContent = 'Data inválida.'; return; }
+    const key = m[3] ? iso(y, mo, d) : pad(mo) + '-' + pad(d);
+    if (!extras.some(h => h.d === key)) extras.push({ d: key, nome: E.hNome.value.trim() || 'Feriado' });
+    extras.sort((a, b) => (a.d.slice(-5) < b.d.slice(-5) ? -1 : 1));
+    E.hData.value = ''; E.hNome.value = '';
+    $('#holArea').innerHTML = drawHol(); E.hData.focus();
+  };
   f.addEventListener('click', e => {
     const rm = e.target.closest('[data-rm]'), ad = e.target.closest('[data-add]');
+    const hr = e.target.closest('[data-hrm]');
+    if (hr) { extras.splice(Number(hr.dataset.hrm), 1); $('#holArea').innerHTML = drawHol(); return; }
+    if (e.target.closest('[data-hadd]')) return addHol();
     if (rm) { cats.splice(Number(rm.dataset.rm), 1); redraw(); }
     else if (ad) addCat(ad.dataset.add);
     else if (e.target.closest('[data-x]')) closeModal();
   });
-  f.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.dataset.new) { e.preventDefault(); addCat(e.target.dataset.new); } });
+  f.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    if (e.target.dataset.new) { e.preventDefault(); addCat(e.target.dataset.new); }
+    else if (e.target.name === 'hData' || e.target.name === 'hNome') { e.preventDefault(); addHol(); }
+  });
   f.addEventListener('submit', e => {
     e.preventDefault();
-    const cfg = { saldoInicial: parseMoney(f.elements.saldo.value), dataInicio: f.elements.inicio.value || (today().slice(0, 4) + '-01-01') };
-    commit(() => { S.cfg = cfg; S.cats = cats; }, [['saveCfg', cfg], ['saveCats', cats]]);
-    closeModal(); toast('Ajustes salvos');
+    const cfg = Object.assign({}, S.cfg, {
+      saldoInicial: parseMoney(f.elements.saldo.value), dataInicio: f.elements.inicio.value || (today().slice(0, 4) + '-01-01'),
+      feriadosNac: f.elements.fNac.checked ? '1' : '0', feriadosFac: f.elements.fFac.checked ? '1' : '0', feriadosExtras: JSON.stringify(extras)
+    });
+    const holChanged = ['feriadosNac', 'feriadosFac', 'feriadosExtras'].some(k => String(S.cfg[k] || '') !== cfg[k]) &&
+      !(S.cfg.feriadosNac === undefined && cfg.feriadosNac === '1' && cfg.feriadosFac === '0' && cfg.feriadosExtras === '[]');
+    const ops = [['saveCfg', cfg], ['saveCats', cats]];
+    let o = null;
+    if (holChanged && S.rules.length) {
+      // Feriados mudaram: recalcula datas e valores dos meses pendentes das recorrências.
+      const old = S.cfg; S.cfg = cfg;
+      o = ruleOps(S.rules, true);
+      S.cfg = old;
+      ruleOpsList(o).forEach(x => ops.push(x));
+    }
+    commit(() => { S.cfg = cfg; S.cats = cats; if (o) applyRuleOps(o); }, ops);
+    closeModal(); toast(o && (o.patches.length || o.adds.length || o.dels.length) ? 'Ajustes salvos · recorrências recalculadas' : 'Ajustes salvos');
   });
 }
 
@@ -1046,6 +1476,8 @@ const ACT = {
   fpay: t => setStatus(t.dataset.ids.split(','), 'Pago', 'Fatura marcada como paga'),
   funpay: t => setStatus(t.dataset.ids.split(','), 'Pendente', 'Pagamento desfeito'),
   cardnew: () => cardModal(),
+  rulenew: () => openRuleForm(),
+  ruleedit: t => { const r = S.rules.find(k => k.id === t.dataset.id); if (r) openRuleForm(r); },
   cardedit: t => cardModal(cardById(t.dataset.id)),
   settings: () => settingsModal(),
   closeDrawer: () => closeDrawer(),
@@ -1122,7 +1554,7 @@ function showConnect(msg) {
       const d = await call('load', [], c);
       conn = c; LS.set('conn', conn); syncErr = '';
       // Alterações ainda não enviadas continuam valendo por cima dos dados recebidos.
-      if (!queue.length) { applyData(d); saveLocal(); }
+      if (!queue.length) { applyData(d); saveLocal(); topUpRules(); }
       hideBoot(); render(); flush();
     } catch (x) {
       err(x instanceof AuthError ? 'Chave de acesso incorreta.'
@@ -1137,7 +1569,7 @@ function showConnect(msg) {
 /* =====================================================================
    Início
    ===================================================================== */
-window.__caixa = { S, firstDue, closingDateForDue, schedule, splitCents, parseMoney, saldoHoje, pendingEvents, runway, monthlyTable, render, flush, refresh };
+window.__caixa = { ruleOccurrence, bizDays, holidays, easter, S, firstDue, closingDateForDue, schedule, splitCents, parseMoney, saldoHoje, pendingEvents, runway, monthlyTable, render, flush, refresh };
 window.addEventListener('online', () => flush().then(() => refresh()));
 document.addEventListener('visibilitychange', () => { if (!document.hidden) flush().then(() => refresh()); });
 setInterval(() => { if (!document.hidden) refresh(); }, 120000);
@@ -1146,12 +1578,12 @@ window.addEventListener('beforeunload', e => { if (queue.length && !LS.get('queu
 (async function start() {
   if (!conn) return showConnect();
   const cached = LS.get('data', null);
-  if (cached) { applyData(cached); hideBoot(); render(); }
+  if (cached) { applyData(cached); hideBoot(); render(); topUpRules(); }
   await flush();
   if (queue.length) { if (!cached) showConnect('Não consegui falar com a planilha.'); return; }
   if (cached) return refresh();
   try {
-    applyData(await call('load')); saveLocal(); hideBoot(); render();
+    applyData(await call('load')); saveLocal(); hideBoot(); render(); topUpRules();
   } catch (e) {
     if (e instanceof AuthError) return showConnect(e.message);
     if (!cached) return showConnect('Não consegui abrir os dados: ' + ((e && e.message) || e));

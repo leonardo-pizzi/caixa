@@ -14,6 +14,26 @@ que é atualizada pelo script de `script/Code.gs`.
   do seu Drive e guarda as 30 mais recentes.
 - Em **Ajustes → Baixar cópia (JSON)** você baixa tudo quando quiser.
 
+## Receitas e despesas fixas
+
+Em **Fluxo de caixa → Receitas e despesas fixas → Nova fixa** (ou **Todo mês** no
+Novo lançamento) você cadastra o que se repete: salário, benefícios, aluguel,
+assinaturas. O site lança sozinho os próximos 12 meses e completa os novos a cada mês.
+
+- **Quando cai:** dia fixo, Nº dia útil (ex.: 5º) ou último dia útil; sábado pode contar.
+- **Valor:** fixo, ou por dia útil (ex.: R$ 47 × dias úteis do próprio mês ou do seguinte).
+- **Sem data de fim**, ou com um mês final. **Encerrar** para a partir do mês escolhido.
+- **Reajuste:** ao mudar o valor, escolha a partir de que mês ele vale.
+- **Um mês diferente** (ex.: pago no crédito): edite só aquele mês na lista; a fixa
+  não mexe mais nele.
+- **Feriados** (Ajustes): nacionais, Carnaval/Corpus Christi opcionais e os da sua cidade.
+
+## Atualizar o script
+
+Quando o `script/Code.gs` mudar, copie o novo conteúdo para o editor do Apps Script,
+salve e vá em **Implantar → Gerenciar implantações → ✏️ → Versão: Nova versão →
+Implantar**. O endereço `/exec` e a chave continuam os mesmos.
+
 ## Instalação (uma vez só)
 
 1. Abra o projeto no [Apps Script](https://script.google.com). Pode ser o projeto
