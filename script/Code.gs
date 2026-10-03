@@ -1,18 +1,24 @@
 /**
  * Caixa — controle financeiro pessoal.
- * Este script é só o "banco de dados": guarda tudo numa planilha Google (abas
- * Lancamentos, Cartoes, Categorias e Config) e responde ao site publicado no
- * GitHub Pages (pasta caixa/ do repositório).
+ * Este script é só o "banco de dados": guarda tudo numa planilha Google e
+ * responde ao site (repositório leonardo-pizzi/caixa, publicado no GitHub Pages).
  *
- * Primeira vez: rode a função `setup` uma vez no editor (autoriza, cria a
- * planilha, a chave de acesso e o backup diário) e depois publique em
+ * Ele é genérico: o site informa em cada pedido quais abas e colunas existem
+ * (o "esquema"), e o script cria o que faltar. Assim, novidades no site não
+ * exigem mudar este código.
+ *
+ * Primeira vez: rode a função `setup` uma vez no editor (autoriza, cria as
+ * abas, a chave de acesso e o backup diário) e depois publique em
  * Implantar > Nova implantação > App da Web, executando como "Eu" e com acesso
- * para "Qualquer pessoa". O passo a passo está em caixa/README.md.
+ * para "Qualquer pessoa". O passo a passo está no README.md.
  */
 
 var BACKUP_FOLDER = 'Caixa - backups';
 var BACKUP_KEEP = 30; // quantas cópias diárias manter
+var API_VERSION = 3;
 
+// Esquema mínimo; o site manda o completo em cada pedido. Colunas em `num` são
+// números, em `bool` verdadeiro/falso; o resto é texto (datas em AAAA-MM-DD).
 var TABLES = {
   Lancamentos: {
     headers: ['id', 'data', 'descricao', 'tipo', 'categoria', 'valor', 'forma', 'cartaoId', 'modo',
@@ -24,13 +30,8 @@ var TABLES = {
     num: ['fechamento', 'vencimento', 'limite'],
     bool: ['ativo']
   },
-  Categorias: {
-    headers: ['nome', 'tipo', 'cor']
-  },
-  Config: {
-    headers: ['chave', 'valor']
-  },
-  // Regras de lançamentos que se repetem todo mês (salário, benefícios, contas fixas).
+  Categorias: { headers: ['nome', 'tipo', 'cor'] },
+  Config: { headers: ['chave', 'valor'] },
   Recorrencias: {
     headers: ['id', 'descricao', 'tipo', 'categoria', 'forma', 'cartaoId', 'valor', 'valorModo', 'refMes',
               'diaModo', 'dia', 'sabado', 'inicio', 'fim', 'pulados', 'ajustados', 'valores', 'obs', 'criadoEm'],
@@ -38,8 +39,6 @@ var TABLES = {
     bool: ['sabado']
   }
 };
-
-var API_VERSION = 2;
 
 var DEFAULT_CATS = [
   ['Moradia', 'Despesa', '#17604F'], ['Mercado', 'Despesa', '#5E7A2E'], ['Alimentação', 'Despesa', '#C26A2B'],
@@ -81,22 +80,59 @@ function doGet() {
   return json_({ ok: true, app: 'caixa' });
 }
 
+var NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,40}$/;
+
+/** Junta o esquema enviado pelo site ao padrão (só acrescenta abas e colunas). */
+function applySchema_(schema) {
+  if (!schema || typeof schema !== 'object') return;
+  Object.keys(schema).forEach(function (name) {
+    var t = schema[name];
+    if (!NAME_RE.test(name) || !t || !Array.isArray(t.headers)) return;
+    var cur = TABLES[name] || (TABLES[name] = { headers: [], num: [], bool: [] });
+    ['headers', 'num', 'bool'].forEach(function (k) {
+      cur[k] = cur[k] || [];
+      (t[k] || []).forEach(function (h) { if (NAME_RE.test(h) && cur[k].indexOf(h) < 0) cur[k].push(h); });
+    });
+    if (t.key && NAME_RE.test(t.key)) cur.key = t.key;
+  });
+}
+
+function table_(name) {
+  if (!NAME_RE.test(String(name)) || !TABLES[name] || name === 'Config') reject_('Aba desconhecida: ' + name);
+  return name;
+}
+function rowsArg_(rows) {
+  if (!Array.isArray(rows)) reject_('Dados inválidos.');
+  return rows.filter(function (r) { return r && typeof r === 'object'; });
+}
+function key_(name) { return TABLES[name].key || 'id'; }
+
 var ACTIONS = {
   load: function () { return api_load(); },
-  addTx: function (rows) { return api_addTx(rows); },
-  updateTx: function (patches) { return api_updateTx(patches); },
-  deleteTx: function (ids) { return api_deleteTx(ids); },
-  setStatus: function (ids, status) { return api_setStatus(ids, status); },
-  saveCard: function (card) { return api_saveCard(card); },
-  deleteCard: function (id) { return api_deleteCard(id); },
-  saveCats: function (cats) { return api_saveCats(cats); },
+  // Operações genéricas, para qualquer aba do esquema.
+  add: function (t, rows) { return api_add(table_(t), rowsArg_(rows)); },
+  update: function (t, patches) { return api_update(table_(t), rowsArg_(patches)); },
+  remove: function (t, ids) { return api_remove(table_(t), Array.isArray(ids) ? ids : []); },
+  upsert: function (t, row) { return api_upsert(table_(t), rowsArg_([row])[0] || reject_('Dados inválidos.')); },
+  replace: function (t, rows) { return api_replace(table_(t), rowsArg_(rows)); },
   saveCfg: function (cfg) { return api_saveCfg(cfg); },
-  saveRule: function (rule) { return api_saveRule(rule); },
-  deleteRule: function (id) { return api_deleteRule(id); }
+  // Nomes antigos, mantidos para alterações que ainda estejam na fila de algum aparelho.
+  addTx: function (rows) { return api_add('Lancamentos', rowsArg_(rows)); },
+  updateTx: function (patches) { return api_update('Lancamentos', rowsArg_(patches)); },
+  deleteTx: function (ids) { return api_remove('Lancamentos', ids || []); },
+  setStatus: function (ids, status) {
+    if (status !== 'Pago' && status !== 'Pendente') reject_('Status inválido');
+    return api_update('Lancamentos', (ids || []).map(function (id) { return { id: id, status: status }; }));
+  },
+  saveCard: function (card) { return api_upsert('Cartoes', card); },
+  deleteCard: function (id) { return api_remove('Cartoes', [id]); },
+  saveCats: function (cats) { return api_replace('Categorias', rowsArg_(cats)); },
+  saveRule: function (rule) { return api_upsert('Recorrencias', rule); },
+  deleteRule: function (id) { return api_remove('Recorrencias', [id]); }
 };
 
 /**
- * Recebe {key, action, args} do site e responde {ok, data} ou {ok: false, error}.
+ * Recebe {key, action, args, schema} do site e responde {ok, data} ou {ok: false, error}.
  * `rejected` marca dados inválidos (o site descarta a alteração); qualquer outra
  * falha o site tenta de novo mais tarde, sem perder nada.
  */
@@ -111,6 +147,7 @@ function doPost(e) {
     } else {
       var fn = ACTIONS[req.action];
       if (!fn) reject_('Ação desconhecida: ' + req.action);
+      applySchema_(req.schema);
       out = { ok: true, data: fn.apply(null, Array.isArray(req.args) ? req.args : []) };
     }
   } catch (err) {
@@ -165,50 +202,63 @@ function getSS_() {
   return ss_;
 }
 
-function getSheet_(name) {
-  var ss = getSS_();
-  var sh = ss.getSheetByName(name);
-  if (sh) return sh;
-  var t = TABLES[name];
-  sh = ss.insertSheet(name);
-  var n = t.headers.length;
-  sh.getRange(1, 1, 1, n).setValues([t.headers]).setFontWeight('bold').setBackground('#E2E9E5');
-  sh.setFrozenRows(1);
-  // Tudo que não é número fica como texto puro: datas em AAAA-MM-DD e nenhum "=..." vira fórmula.
-  t.headers.forEach(function (h, i) {
-    var isNum = t.num && t.num.indexOf(h) > -1;
-    var isBool = t.bool && t.bool.indexOf(h) > -1;
-    if (!isNum && !isBool) sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat('@');
-  });
-  seed_(name, sh);
-  var first = ss.getSheetByName('Planilha1') || ss.getSheetByName('Sheet1');
-  if (first && ss.getSheets().length > 1) { try { ss.deleteSheet(first); } catch (e) { /* ignora */ } }
-  return sh;
+var sheets_ = {}; // abas já conferidas nesta execução
+
+function isText_(t, h) {
+  return !(t.num && t.num.indexOf(h) > -1) && !(t.bool && t.bool.indexOf(h) > -1);
 }
 
-function seed_(name, sh) {
-  if (name === 'Categorias') {
-    sh.getRange(2, 1, DEFAULT_CATS.length, 3).setValues(DEFAULT_CATS);
-  } else if (name === 'Config') {
-    var tz = Session.getScriptTimeZone();
-    var inicio = Utilities.formatDate(new Date(), tz, 'yyyy') + '-01-01';
-    sh.getRange(2, 1, 2, 2).setValues([['saldoInicial', '0'], ['dataInicio', inicio]]);
+/** Devolve a aba, criando-a ou acrescentando as colunas que faltarem. */
+function getSheet_(name) {
+  if (sheets_[name]) return sheets_[name];
+  var ss = getSS_(), t = TABLES[name];
+  var sh = ss.getSheetByName(name), created = false;
+  if (!sh) { sh = ss.insertSheet(name); created = true; }
+  var have = sh.getLastColumn() > 0 ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String) : [];
+  while (have.length && have[have.length - 1] === '') have.pop();
+  var missing = t.headers.filter(function (h) { return have.indexOf(h) < 0; });
+  if (missing.length) {
+    var start = have.length + 1;
+    if (sh.getMaxColumns() < start + missing.length - 1) sh.insertColumnsAfter(sh.getMaxColumns(), start + missing.length - 1 - sh.getMaxColumns());
+    sh.getRange(1, start, 1, missing.length).setValues([missing]).setFontWeight('bold').setBackground('#E2E9E5');
+    // Colunas de texto ficam como texto puro: datas não viram data e "=..." não vira fórmula.
+    missing.forEach(function (h, i) {
+      if (isText_(t, h)) sh.getRange(1, start + i, sh.getMaxRows(), 1).setNumberFormat('@');
+    });
+    have = have.concat(missing);
   }
+  if (created) {
+    sh.setFrozenRows(1);
+    seed_(name, sh, have);
+    var first = ss.getSheetByName('Planilha1') || ss.getSheetByName('Sheet1');
+    if (first && first.getLastRow() === 0 && ss.getSheets().length > 1) { try { ss.deleteSheet(first); } catch (e) { /* ignora */ } }
+  }
+  sheets_[name] = { sh: sh, headers: have };
+  return sheets_[name];
+}
+
+function seed_(name, sh, headers) {
+  var rows = [];
+  if (name === 'Categorias') rows = DEFAULT_CATS.map(function (c) { return { nome: c[0], tipo: c[1], cor: c[2] }; });
+  else if (name === 'Config') {
+    var inicio = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy') + '-01-01';
+    rows = [{ chave: 'saldoInicial', valor: '0' }, { chave: 'dataInicio', valor: inicio }];
+  }
+  if (rows.length) sh.getRange(2, 1, rows.length, headers.length).setValues(toMatrix_(headers, rows));
 }
 
 function readTable_(name) {
-  var t = TABLES[name];
-  var sh = getSheet_(name);
+  var t = TABLES[name], s = getSheet_(name), sh = s.sh, headers = s.headers;
   var last = sh.getLastRow();
   if (last < 2) return [];
   var tz = Session.getScriptTimeZone();
-  var vals = sh.getRange(2, 1, last - 1, t.headers.length).getValues();
+  var vals = sh.getRange(2, 1, last - 1, headers.length).getValues();
   var out = [];
   vals.forEach(function (row) {
-    var empty = row.every(function (c) { return c === '' || c === null; });
-    if (empty) return;
+    if (row.every(function (c) { return c === '' || c === null; })) return;
     var o = {};
-    t.headers.forEach(function (h, i) {
+    headers.forEach(function (h, i) {
+      if (!h) return;
       var v = row[i];
       if (v instanceof Date) v = Utilities.formatDate(v, tz, 'yyyy-MM-dd');
       if (t.num && t.num.indexOf(h) > -1) o[h] = Number(v) || 0;
@@ -220,10 +270,9 @@ function readTable_(name) {
   return out;
 }
 
-function toMatrix_(name, rows) {
-  var t = TABLES[name];
+function toMatrix_(headers, rows) {
   return rows.map(function (r) {
-    return t.headers.map(function (h) { return (r[h] === undefined || r[h] === null) ? '' : r[h]; });
+    return headers.map(function (h) { var v = r[h]; return (v === undefined || v === null) ? '' : v; });
   });
 }
 
@@ -232,22 +281,20 @@ function ensureRows_(sh, needed) {
 }
 
 function writeTable_(name, rows) {
-  var t = TABLES[name];
-  var sh = getSheet_(name);
+  var s = getSheet_(name), sh = s.sh, n = s.headers.length;
   var last = sh.getLastRow();
-  if (last > 1) sh.getRange(2, 1, last - 1, t.headers.length).clearContent();
+  if (last > 1) sh.getRange(2, 1, last - 1, n).clearContent();
   if (!rows.length) return;
   ensureRows_(sh, rows.length + 1);
-  sh.getRange(2, 1, rows.length, t.headers.length).setValues(toMatrix_(name, rows));
+  sh.getRange(2, 1, rows.length, n).setValues(toMatrix_(s.headers, rows));
 }
 
 function appendRows_(name, rows) {
   if (!rows.length) return;
-  var t = TABLES[name];
-  var sh = getSheet_(name);
+  var s = getSheet_(name), sh = s.sh;
   var start = Math.max(sh.getLastRow(), 1) + 1;
   ensureRows_(sh, start + rows.length);
-  sh.getRange(start, 1, rows.length, t.headers.length).setValues(toMatrix_(name, rows));
+  sh.getRange(start, 1, rows.length, s.headers.length).setValues(toMatrix_(s.headers, rows));
 }
 
 function withLock_(fn) {
@@ -256,106 +303,79 @@ function withLock_(fn) {
   try { return fn(); } finally { lock.releaseLock(); }
 }
 
-/* ------------------------------------------------------------------ API (chamada pelo navegador) */
+/* ------------------------------------------------------------------ API (chamada pelo site) */
 
 function api_load() {
-  var cfgRows = readTable_('Config');
   var cfg = { saldoInicial: 0, dataInicio: '' };
-  cfgRows.forEach(function (r) {
+  readTable_('Config').forEach(function (r) {
     if (!r.chave) return;
     cfg[r.chave] = r.chave === 'saldoInicial' ? (Number(String(r.valor).replace(',', '.')) || 0) : r.valor;
   });
+  var tables = {};
+  Object.keys(TABLES).forEach(function (n) { if (n !== 'Config') tables[n] = readTable_(n); });
   return {
-    v: API_VERSION,
-    cfg: cfg,
-    cards: readTable_('Cartoes'),
-    cats: readTable_('Categorias'),
-    tx: readTable_('Lancamentos'),
-    rules: readTable_('Recorrencias'),
+    v: API_VERSION, cfg: cfg, tables: tables,
+    // nomes usados pelo site desde a primeira versão
+    cards: tables.Cartoes, cats: tables.Categorias, tx: tables.Lancamentos, rules: tables.Recorrencias,
     ssUrl: getSS_().getUrl()
   };
 }
 
-function api_addTx(rows) {
-  if (!Array.isArray(rows)) reject_('Lançamentos inválidos.');
+/** Acrescenta linhas; as que já existem (mesmo id) são ignoradas, então reenviar não duplica. */
+function api_add(name, rows) {
   return withLock_(function () {
-    // Se o envio for repetido (resposta perdida na rede), não duplica.
-    var seen = {};
-    readTable_('Lancamentos').forEach(function (r) { seen[r.id] = true; });
-    appendRows_('Lancamentos', rows.filter(function (r) { return r && r.id && !seen[r.id]; }));
+    var k = key_(name), seen = {};
+    readTable_(name).forEach(function (r) { seen[r[k]] = true; });
+    appendRows_(name, rows.filter(function (r) {
+      if (!r[k] || seen[r[k]]) return false;
+      seen[r[k]] = true; return true;
+    }));
     return true;
   });
 }
 
 /** patches: [{id, campo: valor, ...}] — só altera os campos enviados. */
-function api_updateTx(patches) {
+function api_update(name, patches) {
   return withLock_(function () {
-    var all = readTable_('Lancamentos');
-    var byId = {};
-    patches.forEach(function (p) { byId[p.id] = p; });
+    var k = key_(name), all = readTable_(name), byId = {};
+    patches.forEach(function (p) { byId[p[k]] = p; });
     all.forEach(function (r) {
-      var p = byId[r.id];
+      var p = byId[r[k]];
       if (!p) return;
-      Object.keys(p).forEach(function (k) { if (k !== 'id' && k in r) r[k] = p[k]; });
+      Object.keys(p).forEach(function (f) { if (f !== k && f in r) r[f] = p[f]; });
     });
-    writeTable_('Lancamentos', all);
+    writeTable_(name, all);
     return true;
   });
 }
 
-function api_deleteTx(ids) {
+function api_remove(name, ids) {
   return withLock_(function () {
-    var drop = {};
+    var k = key_(name), drop = {};
     ids.forEach(function (i) { drop[i] = true; });
-    var keep = readTable_('Lancamentos').filter(function (r) { return !drop[r.id]; });
-    writeTable_('Lancamentos', keep);
+    writeTable_(name, readTable_(name).filter(function (r) { return !drop[r[k]]; }));
     return true;
   });
 }
 
-function api_setStatus(ids, status) {
-  if (status !== 'Pago' && status !== 'Pendente') reject_('Status inválido');
+function api_upsert(name, row) {
+  if (!row || !row[key_(name)]) reject_('Dados inválidos.');
   return withLock_(function () {
-    var mark = {};
-    ids.forEach(function (i) { mark[i] = true; });
-    var all = readTable_('Lancamentos');
-    all.forEach(function (r) { if (mark[r.id]) r.status = status; });
-    writeTable_('Lancamentos', all);
+    var k = key_(name), all = readTable_(name), found = false;
+    all = all.map(function (r) { if (r[k] === row[k]) { found = true; return row; } return r; });
+    if (!found) all.push(row);
+    writeTable_(name, all);
     return true;
   });
 }
 
-function api_saveCard(card) {
-  return withLock_(function () {
-    var all = readTable_('Cartoes');
-    var found = false;
-    all = all.map(function (c) {
-      if (c.id === card.id) { found = true; return card; }
-      return c;
-    });
-    if (!found) all.push(card);
-    writeTable_('Cartoes', all);
-    return true;
-  });
-}
-
-function api_deleteCard(id) {
-  return withLock_(function () {
-    writeTable_('Cartoes', readTable_('Cartoes').filter(function (c) { return c.id !== id; }));
-    return true;
-  });
-}
-
-function api_saveCats(cats) {
-  return withLock_(function () {
-    writeTable_('Categorias', cats);
-    return true;
-  });
+function api_replace(name, rows) {
+  return withLock_(function () { writeTable_(name, rows); return true; });
 }
 
 function api_saveCfg(cfg) {
+  if (!cfg || typeof cfg !== 'object') reject_('Ajustes inválidos.');
   return withLock_(function () {
-    if (!cfg || typeof cfg !== 'object') reject_('Ajustes inválidos.');
     // Guarda todas as chaves enviadas (saldo, data de início, feriados…), sempre como texto.
     var rows = Object.keys(cfg).map(function (k) {
       var v = cfg[k];
@@ -363,24 +383,6 @@ function api_saveCfg(cfg) {
       return { chave: k, valor: (v !== null && typeof v === 'object') ? JSON.stringify(v) : String(v === undefined || v === null ? '' : v) };
     });
     writeTable_('Config', rows);
-    return true;
-  });
-}
-
-function api_saveRule(rule) {
-  if (!rule || !rule.id) reject_('Recorrência inválida.');
-  return withLock_(function () {
-    var all = readTable_('Recorrencias'), found = false;
-    all = all.map(function (r) { if (r.id === rule.id) { found = true; return rule; } return r; });
-    if (!found) all.push(rule);
-    writeTable_('Recorrencias', all);
-    return true;
-  });
-}
-
-function api_deleteRule(id) {
-  return withLock_(function () {
-    writeTable_('Recorrencias', readTable_('Recorrencias').filter(function (r) { return r.id !== id; }));
     return true;
   });
 }

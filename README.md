@@ -30,9 +30,11 @@ assinaturas. O site lança sozinho os próximos 12 meses e completa os novos a c
 
 ## Atualizar o script
 
-Quando o `script/Code.gs` mudar, copie o novo conteúdo para o editor do Apps Script,
-salve e vá em **Implantar → Gerenciar implantações → ✏️ → Versão: Nova versão →
-Implantar**. O endereço `/exec` e a chave continuam os mesmos.
+O script é genérico: o site diz em cada pedido quais abas e colunas existem e o
+script cria o que faltar. Por isso, melhorias no site **não exigem** mexer nele.
+Só se o `script/Code.gs` mudar (raro): copie o novo conteúdo para o editor do Apps
+Script, salve e vá em **Implantar → Gerenciar implantações → ✏️ → Versão: Nova
+versão → Implantar**. Os dados, o endereço `/exec` e a chave continuam os mesmos.
 
 ## Instalação (uma vez só)
 

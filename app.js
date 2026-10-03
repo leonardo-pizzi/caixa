@@ -281,6 +281,16 @@ let conn = LS.get('conn', null);   // { url, key } do script na planilha
 let queue = LS.get('queue', []);   // alterações ainda não confirmadas pela planilha
 let flushing = false, retryTimer = null, syncErr = '', edits = 0;
 
+// Abas e colunas da planilha. O script cria sozinho o que faltar, então
+// colunas e abas novas só precisam ser declaradas aqui.
+const SCHEMA = {
+  Lancamentos: { headers: ['id', 'data', 'descricao', 'tipo', 'categoria', 'valor', 'forma', 'cartaoId', 'modo', 'parcela', 'total', 'grupo', 'vencimento', 'status', 'obs', 'criadoEm'], num: ['valor', 'parcela', 'total'] },
+  Cartoes: { headers: ['id', 'nome', 'fechamento', 'vencimento', 'limite', 'cor', 'ativo'], num: ['fechamento', 'vencimento', 'limite'], bool: ['ativo'] },
+  Categorias: { headers: ['nome', 'tipo', 'cor'], key: 'nome' },
+  Config: { headers: ['chave', 'valor'], key: 'chave' },
+  Recorrencias: { headers: ['id', 'descricao', 'tipo', 'categoria', 'forma', 'cartaoId', 'valor', 'valorModo', 'refMes', 'diaModo', 'dia', 'sabado', 'inicio', 'fim', 'pulados', 'ajustados', 'valores', 'obs', 'criadoEm'], num: ['valor', 'dia'], bool: ['sabado'] }
+};
+
 class AuthError extends Error {}
 class RejectedError extends Error {}
 
@@ -288,7 +298,7 @@ class RejectedError extends Error {}
 async function call(action, args, c) {
   c = c || conn;
   if (!c) throw new AuthError('Conexão não configurada.');
-  const res = await fetch(c.url, { method: 'POST', body: JSON.stringify({ key: c.key, action, args: args || [] }) });
+  const res = await fetch(c.url, { method: 'POST', body: JSON.stringify({ key: c.key, action, args: args || [], schema: SCHEMA }) });
   if (!res.ok) throw new Error('A planilha respondeu com erro ' + res.status + '.');
   let j;
   try { j = await res.json(); } catch (e) { throw new Error('Resposta inesperada. Confira o endereço e se a implantação permite acesso a "Qualquer pessoa".'); }
